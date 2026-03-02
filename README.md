@@ -1,22 +1,22 @@
 # rcroc
 
-Rust 实现的 croc 风格文件传输工具（rcroc 协议）。
+A Rust implementation of a croc-style file transfer tool (rcroc protocol).
 
-## 1 分钟上手
+## 1-minute quick start
 
-先启动 relay（服务端）：
+Start a relay (server):
 
 ```bash
 rcroc relay --listen 0.0.0.0:9009
 ```
 
-发送端：
+Sender:
 
 ```bash
 rcroc send /path/to/file --relay 107.174.204.124:9009
 ```
 
-发送端会输出类似：
+The sender will print output like this:
 
 ```text
 Code is: fLuOQ4XY
@@ -26,78 +26,78 @@ On the other computer run
 rcroc fLuOQ4XY --relay 107.174.204.124:9009
 ```
 
-接收端（简写）：
+Receiver (shorthand):
 
 ```bash
 rcroc fLuOQ4XY --relay 107.174.204.124:9009
 ```
 
-也支持完整写法：
+Full form is also supported:
 
 ```bash
 rcroc receive --secret fLuOQ4XY --relay 107.174.204.124:9009
 ```
 
-## 默认行为（无需手动写）
+## Default behavior (no need to type these)
 
-- 默认启用 LAN 探测与局域网数据通道升级（可自动绕过远端 relay 走内网）
-- 默认 `--transfers 4`
-- 默认 `--hash-algorithm xxh3`
-- 默认 `--relay-password pass`
-- 默认接收目录 `--out .`
+- LAN discovery and LAN data-path upgrade are enabled by default (can automatically bypass remote relay for LAN transfer)
+- Default `--transfers 4`
+- Default `--hash-algorithm xxh3`
+- Default `--relay-password pass`
+- Default output directory `--out .`
 
-所以日常命令不需要写这些默认参数。
+In normal usage, you can omit these default arguments.
 
-## 进度显示
+## Progress display
 
-- 发送端：每个文件显示 `Sending ...` 进度条、百分比、吞吐速率。
-- 接收端：每个文件显示 `Receiving ...` 进度条、百分比、吞吐速率。
+- Sender: each file shows a `Sending ...` progress bar, percentage, and throughput.
+- Receiver: each file shows a `Receiving ...` progress bar, percentage, and throughput.
 
-## 常用场景
+## Common scenarios
 
-发送目录：
+Send a directory:
 
 ```bash
 rcroc send ./my-dir --relay 107.174.204.124:9009
 ```
 
-指定接收目录：
+Set receiver output directory:
 
 ```bash
 rcroc fLuOQ4XY --relay 107.174.204.124:9009 --out /tmp/downloads
 ```
 
-关闭 LAN 探测（强制仅走 relay）：
+Disable LAN discovery (force relay-only path):
 
 ```bash
 rcroc send ./file.bin --relay 107.174.204.124:9009 --no-lan-discovery
 ```
 
-自定义 relay 密码（两端必须一致）：
+Custom relay password (must match on both sides):
 
 ```bash
 rcroc send ./file.bin --relay 107.174.204.124:9009 --relay-password yourpass
 rcroc fLuOQ4XY --relay 107.174.204.124:9009 --relay-password yourpass
 ```
 
-## 开发构建
+## Development build
 
 ```bash
 cargo build --release
 ```
 
-## 主要能力
+## Core capabilities
 
-- relay 中继（房间匹配 + 双向 pipe）
-- 端到端加密传输（P-256 ECDH + PBKDF2 + AES-256-GCM）
-- 多文件/目录传输（含空目录）
-- 断点续传
-- 多路并发传输
-- LAN 探测 + 局域网数据通道升级
-- 代理支持（SOCKS5、HTTP CONNECT）
-- `.gitignore` 过滤
+- Relay mode (room matching + bidirectional pipe)
+- End-to-end encrypted transfer (P-256 ECDH + PBKDF2 + AES-256-GCM)
+- Multi-file and directory transfer (including empty directories)
+- Resume support
+- Multi-stream parallel transfer
+- LAN discovery + LAN data-path upgrade
+- Proxy support (SOCKS5, HTTP CONNECT)
+- `.gitignore` filtering
 
-## 已知限制
+## Known limitations
 
-- 仅保证 rcroc 协议互通，不保证与 Go `croc` 互通
-- 暂未实现限速、QR、SOCKS5/HTTP 认证头
+- Only rcroc protocol compatibility is guaranteed; compatibility with Go `croc` is not guaranteed
+- Rate limit, QR, and SOCKS5/HTTP auth headers are not implemented yet
