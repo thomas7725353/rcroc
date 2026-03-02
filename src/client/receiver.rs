@@ -3,12 +3,13 @@ use std::{
     sync::Arc,
 };
 
+use indicatif::ProgressBar;
 use tokio::{
     fs,
     io::{AsyncSeekExt, AsyncWriteExt},
     net::TcpStream,
     sync::Mutex,
-    time::Duration,
+    time::{Duration, timeout},
 };
 use tracing::{info, warn};
 
@@ -17,7 +18,7 @@ use crate::{
     discover,
     error::{RcrocError, Result},
     hash,
-    models::FileRequest,
+    models::{ChunkRange, FileRequest},
     net,
     protocol::{
         message::{
@@ -26,6 +27,7 @@ use crate::{
         },
         pake::{receiver_handshake, room_name_from_secret},
     },
+    ui,
 };
 
 pub struct ReceiveConfig {
@@ -54,6 +56,13 @@ struct DataReceiverSpawn {
     proxy: Option<String>,
     session_key: [u8; 32],
     shared: Arc<ReceiveFileShared>,
+    progress: Option<Arc<ProgressBar>>,
+}
+
+struct DataRelayPath {
+    connect_addr: String,
+    proxy: Option<String>,
+    request_addr: Option<String>,
 }
 
 pub async fn run_receive(cfg: ReceiveConfig) -> Result<()> {
@@ -116,6 +125,20 @@ pub async fn run_receive(cfg: ReceiveConfig) -> Result<()> {
             crate::models::CHUNK_SIZE
         )));
     }
+    let data_relay = select_data_relay_path(
+        &relay_addr,
+        cfg.proxy.clone(),
+        &plan.sender_local_relay_addrs,
+        cfg.lan_discovery,
+    )
+    .await;
+    info!(
+        "receiver data relay path: {}",
+        data_relay
+            .request_addr
+            .as_deref()
+            .unwrap_or(&data_relay.connect_addr)
+    );
 
     for dir in &plan.empty_dirs {
         let safe = sanitize_relative_path(dir)?;
@@ -177,18 +200,27 @@ pub async fn run_receive(cfg: ReceiveConfig) -> Result<()> {
             resume: Mutex::new(resume),
         });
 
+        let progress = if missing.is_empty() {
+            None
+        } else {
+            Some(Arc::new(ui::new_transfer_progress(
+                format!("Receiving {}", file_meta.relative_path),
+                missing_bytes(file_meta.size, &missing),
+            )))
+        };
         let workers = if missing.is_empty() {
             Vec::new()
         } else {
             spawn_data_receivers(DataReceiverSpawn {
-                relay_addr: relay_addr.clone(),
+                relay_addr: data_relay.connect_addr.clone(),
                 relay_password: cfg.relay_password.clone(),
                 base_room: room.clone(),
                 file_index: index as u32,
                 transfers,
-                proxy: cfg.proxy.clone(),
+                proxy: data_relay.proxy.clone(),
                 session_key,
                 shared: shared.clone(),
+                progress: progress.clone(),
             })
             .await?
         };
@@ -200,6 +232,7 @@ pub async fn run_receive(cfg: ReceiveConfig) -> Result<()> {
                 file_index: index as u32,
                 missing_chunks: missing,
                 transfers: Some(transfers),
+                data_relay_addr: data_relay.request_addr.clone(),
             })),
         )
         .await?;
@@ -219,6 +252,9 @@ pub async fn run_receive(cfg: ReceiveConfig) -> Result<()> {
             worker
                 .await
                 .map_err(|e| RcrocError::Protocol(format!("receiver worker join failed: {e}")))??;
+        }
+        if let Some(pb) = progress {
+            pb.finish();
         }
 
         let actual_hash = hash::hash_file(target.clone(), plan.hash_algorithm).await?;
@@ -273,6 +309,7 @@ async fn spawn_data_receivers(
         let shared = params.shared.clone();
         let session_key = params.session_key;
         let file_index = params.file_index;
+        let progress = params.progress.clone();
 
         let h = tokio::spawn(async move {
             let mut stream =
@@ -297,7 +334,7 @@ async fn spawn_data_receivers(
                                 "data file index mismatch: got {incoming}, expected {file_index}"
                             )));
                         }
-                        write_chunk(&shared, position, &data).await?;
+                        write_chunk(&shared, position, &data, progress.as_deref()).await?;
                     }
                     EncryptedPacket::Control(PlainMessage::Error { message }) => {
                         return Err(RcrocError::Protocol(message));
@@ -319,7 +356,12 @@ async fn spawn_data_receivers(
     Ok(out)
 }
 
-async fn write_chunk(shared: &Arc<ReceiveFileShared>, position: u64, data: &[u8]) -> Result<()> {
+async fn write_chunk(
+    shared: &Arc<ReceiveFileShared>,
+    position: u64,
+    data: &[u8],
+    progress: Option<&ProgressBar>,
+) -> Result<()> {
     {
         let mut file = shared.file.lock().await;
         file.seek(std::io::SeekFrom::Start(position)).await?;
@@ -329,7 +371,25 @@ async fn write_chunk(shared: &Arc<ReceiveFileShared>, position: u64, data: &[u8]
     let chunk_index = (position / crate::models::CHUNK_SIZE as u64) as usize;
     let mut resume = shared.resume.lock().await;
     resume.mark_chunk(chunk_index).await?;
+    if let Some(pb) = progress {
+        pb.inc(data.len() as u64);
+    }
     Ok(())
+}
+
+fn missing_bytes(size: u64, ranges: &[ChunkRange]) -> u64 {
+    let mut total = 0u64;
+    for range in ranges {
+        for chunk in range.start..range.end {
+            let pos = chunk * crate::models::CHUNK_SIZE as u64;
+            if pos >= size {
+                continue;
+            }
+            let remain = size - pos;
+            total += remain.min(crate::models::CHUNK_SIZE as u64);
+        }
+    }
+    total
 }
 
 fn sanitize_relative_path(path: &str) -> Result<PathBuf> {
@@ -385,6 +445,48 @@ fn is_stream_closed(err: &RcrocError) -> bool {
 fn dedup_relay_candidates(candidates: &mut Vec<(String, Option<String>)>) {
     let mut seen = std::collections::HashSet::new();
     candidates.retain(|v| seen.insert((v.0.clone(), v.1.clone())));
+}
+
+async fn select_data_relay_path(
+    control_relay_addr: &str,
+    control_proxy: Option<String>,
+    sender_local_relay_addrs: &[String],
+    lan_discovery: bool,
+) -> DataRelayPath {
+    if !lan_discovery || sender_local_relay_addrs.is_empty() {
+        return DataRelayPath {
+            connect_addr: control_relay_addr.to_string(),
+            proxy: control_proxy,
+            request_addr: None,
+        };
+    }
+
+    for addr in sender_local_relay_addrs {
+        if addr == control_relay_addr {
+            continue;
+        }
+
+        if is_direct_relay_reachable(addr).await {
+            return DataRelayPath {
+                connect_addr: addr.clone(),
+                proxy: None,
+                request_addr: Some(addr.clone()),
+            };
+        }
+    }
+
+    DataRelayPath {
+        connect_addr: control_relay_addr.to_string(),
+        proxy: control_proxy,
+        request_addr: None,
+    }
+}
+
+async fn is_direct_relay_reachable(addr: &str) -> bool {
+    matches!(
+        timeout(Duration::from_millis(500), net::connect_target(addr, None)).await,
+        Ok(Ok(_))
+    )
 }
 
 async fn connect_and_join(

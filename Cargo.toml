@@ -1,6 +1,6 @@
 [package]
 name = "rcroc"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -10,6 +10,8 @@ clap = { version = "4", features = ["derive"] }
 flate2 = "1"
 globset = "0.4"
 hex = "0.4"
+if-addrs = "0.13"
+indicatif = "0.17"
 p256 = { version = "0.13", features = ["ecdh"] }
 pbkdf2 = "0.12"
 rand = "0.8"

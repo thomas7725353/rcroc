@@ -29,6 +29,8 @@ pub struct TransferPlan {
     pub transfers: usize,
     pub no_compress: bool,
     pub hash_algorithm: HashAlgorithm,
+    #[serde(default)]
+    pub sender_local_relay_addrs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,4 +45,6 @@ pub struct FileRequest {
     pub missing_chunks: Vec<ChunkRange>,
     #[serde(default)]
     pub transfers: Option<usize>,
+    #[serde(default)]
+    pub data_relay_addr: Option<String>,
 }

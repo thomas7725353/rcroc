@@ -1,5 +1,6 @@
 use std::net::ToSocketAddrs;
 
+use if_addrs::{IfAddr, get_if_addrs};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -89,6 +90,11 @@ fn find_headers_end(buf: &[u8]) -> Option<usize> {
 }
 
 pub fn local_ipv4_for_advertise() -> Option<String> {
+    let mut addrs = local_ipv4_addrs();
+    if let Some(ip) = addrs.pop() {
+        return Some(ip);
+    }
+
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
     let addr = socket.local_addr().ok()?;
@@ -97,6 +103,23 @@ pub fn local_ipv4_for_advertise() -> Option<String> {
     } else {
         None
     }
+}
+
+pub fn local_ipv4_addrs() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(ifaces) = get_if_addrs() {
+        for iface in ifaces {
+            if iface.is_loopback() {
+                continue;
+            }
+            if let IfAddr::V4(v4) = iface.addr {
+                out.push(v4.ip.to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 pub fn normalize_advertise_addr(relay_addr: &str) -> String {

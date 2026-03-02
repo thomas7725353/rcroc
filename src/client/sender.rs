@@ -4,10 +4,12 @@ use std::{
     fs::File,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
+    sync::Arc,
     time::UNIX_EPOCH,
 };
 
 use globset::{Glob, GlobMatcher};
+use indicatif::ProgressBar;
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncSeekExt},
@@ -31,6 +33,7 @@ use crate::{
         pake::{room_name_from_secret, sender_handshake},
     },
     relay,
+    ui,
 };
 
 pub struct SendConfig {
@@ -65,6 +68,7 @@ struct RelayCandidate {
 struct LocalRelayInfo {
     connect_addr: String,
     advertise_addr: String,
+    advertise_addrs: Vec<String>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -77,11 +81,12 @@ struct TransferDispatch {
     transfers: usize,
     session_key: [u8; 32],
     compress: bool,
+    progress: Option<Arc<ProgressBar>>,
 }
 
 pub async fn run_send(cfg: SendConfig) -> Result<()> {
     let transfers = cfg.transfers.max(1);
-    let (plan, sender_files) =
+    let (mut plan, sender_files) =
         collect_transfer_plan(&cfg.paths, cfg.no_compress, transfers, cfg.hash_algorithm)?;
     if plan.files.is_empty() && plan.empty_dirs.is_empty() {
         return Err(RcrocError::InvalidPath(
@@ -102,6 +107,9 @@ pub async fn run_send(cfg: SendConfig) -> Result<()> {
     } else {
         None
     };
+    if let Some(local) = &local_relay {
+        plan.sender_local_relay_addrs = local.advertise_addrs.clone();
+    }
 
     let mut discovery_task = None;
     if cfg.lan_discovery {
@@ -182,8 +190,10 @@ pub async fn run_send(cfg: SendConfig) -> Result<()> {
                 jobs.len(),
                 negotiated_transfers
             );
+            let data_relay =
+                resolve_requested_data_relay(&request, &active_relay, local_relay.as_ref());
             let dispatch = TransferDispatch {
-                relay: active_relay.clone(),
+                relay: data_relay,
                 relay_password: cfg.relay_password.clone(),
                 base_room: room.clone(),
                 file_index: request.file_index,
@@ -191,6 +201,10 @@ pub async fn run_send(cfg: SendConfig) -> Result<()> {
                 transfers: negotiated_transfers,
                 session_key,
                 compress: !cfg.no_compress,
+                progress: Some(Arc::new(ui::new_transfer_progress(
+                    format!("Sending {}", sender_file.meta.relative_path),
+                    total_job_bytes(&jobs),
+                ))),
             };
             transfer_file_chunks(dispatch, jobs).await?;
         }
@@ -251,6 +265,7 @@ async fn transfer_file_chunks(dispatch: TransferDispatch, jobs: Vec<ChunkJob>) -
         let key = dispatch.session_key;
         let use_compress = dispatch.compress;
         let file_index = dispatch.file_index;
+        let progress = dispatch.progress.clone();
 
         let handle = tokio::spawn(async move {
             let mut stream =
@@ -274,6 +289,9 @@ async fn transfer_file_chunks(dispatch: TransferDispatch, jobs: Vec<ChunkJob>) -
                     },
                 )
                 .await?;
+                if let Some(pb) = &progress {
+                    pb.inc(job.length as u64);
+                }
             }
 
             Ok::<(), RcrocError>(())
@@ -285,6 +303,9 @@ async fn transfer_file_chunks(dispatch: TransferDispatch, jobs: Vec<ChunkJob>) -
     for h in handles {
         h.await
             .map_err(|e| RcrocError::Protocol(format!("sender worker join failed: {e}")))??;
+    }
+    if let Some(pb) = &dispatch.progress {
+        pb.finish();
     }
 
     Ok(())
@@ -317,6 +338,10 @@ fn build_chunk_jobs(size: u64, ranges: &[ChunkRange]) -> Result<Vec<ChunkJob>> {
     }
 
     Ok(out)
+}
+
+fn total_job_bytes(jobs: &[ChunkJob]) -> u64 {
+    jobs.iter().map(|v| v.length as u64).sum()
 }
 
 fn collect_transfer_plan(
@@ -378,6 +403,7 @@ fn collect_transfer_plan(
         transfers,
         no_compress,
         hash_algorithm,
+        sender_local_relay_addrs: Vec::new(),
     };
 
     Ok((plan, files))
@@ -607,8 +633,11 @@ async fn start_local_relay(relay_password: &str) -> Result<LocalRelayInfo> {
     let listener = TcpListener::bind("0.0.0.0:0").await?;
     let port = listener.local_addr()?.port();
     let connect_addr = format!("127.0.0.1:{port}");
-    let advertise_ip = net::local_ipv4_for_advertise().unwrap_or_else(|| "127.0.0.1".to_string());
-    let advertise_addr = format!("{advertise_ip}:{port}");
+    let advertise_addrs = build_local_relay_advertise_addrs(port);
+    let advertise_addr = advertise_addrs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("127.0.0.1:{port}"));
     let relay_password = relay_password.to_string();
 
     let task = tokio::spawn(async move {
@@ -621,8 +650,57 @@ async fn start_local_relay(relay_password: &str) -> Result<LocalRelayInfo> {
     Ok(LocalRelayInfo {
         connect_addr,
         advertise_addr,
+        advertise_addrs,
         _task: task,
     })
+}
+
+fn build_local_relay_advertise_addrs(port: u16) -> Vec<String> {
+    let mut out = net::local_ipv4_addrs();
+    if out.is_empty() {
+        if let Some(ip) = net::local_ipv4_for_advertise() {
+            out.push(ip);
+        } else {
+            out.push("127.0.0.1".to_string());
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out.into_iter().map(|ip| format!("{ip}:{port}")).collect()
+}
+
+fn resolve_requested_data_relay(
+    request: &crate::models::FileRequest,
+    active_relay: &RelayCandidate,
+    local_relay: Option<&LocalRelayInfo>,
+) -> RelayCandidate {
+    let Some(requested_addr) = request.data_relay_addr.as_deref() else {
+        return active_relay.clone();
+    };
+
+    if requested_addr == active_relay.addr {
+        return active_relay.clone();
+    }
+
+    if let Some(local) = local_relay
+        && local.advertise_addrs.iter().any(|v| v == requested_addr)
+    {
+        info!(
+            "sender switched data path to local relay for file #{} via {}",
+            request.file_index, requested_addr
+        );
+        return RelayCandidate {
+            addr: local.connect_addr.clone(),
+            proxy: None,
+        };
+    }
+
+    warn!(
+        "ignoring requested data relay '{}' for file #{}; using active relay {}",
+        requested_addr, request.file_index, active_relay.addr
+    );
+    active_relay.clone()
 }
 
 fn dedup_candidates(candidates: &mut Vec<RelayCandidate>) {

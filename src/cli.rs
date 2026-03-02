@@ -36,16 +36,18 @@ pub enum Commands {
         relay: String,
         #[arg(long, default_value = "pass")]
         relay_password: String,
-        #[arg(long, default_value_t = 4)]
+        #[arg(long, default_value_t = 4, hide = true)]
         transfers: usize,
         #[arg(long)]
         no_compress: bool,
-        #[arg(long, value_enum, default_value_t = HashArg::Sha256)]
+        #[arg(long, value_enum, default_value_t = HashArg::Xxh3, hide = true)]
         hash_algorithm: HashArg,
         #[arg(long)]
         proxy: Option<String>,
-        #[arg(long)]
+        #[arg(long, hide = true)]
         lan_discovery: bool,
+        #[arg(long)]
+        no_lan_discovery: bool,
     },
     Receive {
         #[arg(long)]
@@ -56,12 +58,14 @@ pub enum Commands {
         relay_password: String,
         #[arg(long, default_value = ".")]
         out: PathBuf,
-        #[arg(long, default_value_t = 4)]
+        #[arg(long, default_value_t = 4, hide = true)]
         transfers: usize,
         #[arg(long)]
         proxy: Option<String>,
-        #[arg(long)]
+        #[arg(long, hide = true)]
         lan_discovery: bool,
+        #[arg(long)]
+        no_lan_discovery: bool,
         #[arg(long, default_value_t = 3)]
         discover_timeout: u64,
         #[arg(long, default_value_t = true)]
